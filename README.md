@@ -1,9 +1,12 @@
 # nostr-connect-demo
 Demo app pair for Nostr Connect NIP-46
 
+## Warning
+
+This a sample demo, the signer does blind signing, use only with test keys (never with personal or other keys in production)!
+
 ## How to run
 
-- Set up an accessible relay in `noco-client/src/main.rs`
 - Run the client
 
 ```
@@ -11,13 +14,17 @@ cd noco-client
 cargo run
 ```
 
-- Copy paste the Nostr Connect URI from the output, and set it in `noco-signer/src/main.rs`
-- Run the server
+- Run the server (from another session)
 
 ```
 cd noco-signer
 cargo run
 ```
+
+- Optionally you may want to set your own relay, in `noco-client/src/main.rs` `APP_RELAY`
+- You may want to use a different client app key (`APP_SECRET_KEY`)
+- If you do any change like the above, you need to copy paste the Nostr Connect URI from the output of the client, to `noco-signer/src/main.rs` `SAMPLE_NOSTR_CONNECT_URL`
+- You may want to use different keys for the signer (`USER_SECRET_KEY`)
 
 ## Flow
 
