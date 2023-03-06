@@ -1,0 +1,13 @@
+[package]
+name = "noconnect-client"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+env_logger = "0.10.0"
+nostr-sdk = "0.19.1"
+serde_json = "1.0.93"
+thiserror = "1.0.38"
+tokio = "1.26.0"
