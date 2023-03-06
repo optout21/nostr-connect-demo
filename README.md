@@ -1,7 +1,7 @@
 # nostr-connect-demo
 Demo app pair for Nostr Connect NIP-46
 
-### How to run
+## How to run
 
 - Set up an accessible relay in `noco-client/src/main.rs`
 - Run the client
@@ -19,7 +19,7 @@ cd noco-signer
 cargo run
 ```
 
-### Flow
+## Flow
 
 The flow of events is somthing like this:
 
@@ -33,7 +33,7 @@ The flow of events is somthing like this:
 - Signer signs and replies
 - Client publiches the resulting signed message
 
-### Sample Output
+## Sample Output
 
 ```
 My pubkey 79dff8f82963424e0bb02708a22e44b4980893e3a4be0fa3cb60a43b946764e3
@@ -57,3 +57,12 @@ New message received response
 Got SignEvent response, Signature(2938b74b2c66cdf565fc5acf3132c3859b6d9fd1e5d108e71a71a5bcc5cf661d4a28f2fbee5a9c2d8033075fd12a82c204c93844b61f854fa86ccb1d7dd43c3b)
 Published event, count 1, id 8f9e4f0a076da48f5bf261a257e2d2fd229ad01eac8851f9995d5e6af5732a97
 ```
+
+## References
+
+- NIP-26 Delegations Spec https://github.com/nostr-protocol/nips/blob/master/26.md
+- [Sample](https://github.com/rust-nostr/nostr/blob/master/crates/nostr-sdk/examples/nostr_connect.rs) in [rust-nostr/nostr-sdk](https://github.com/rust-nostr/nostr) by [yukibtc](https://github.com/yukibtc)
+
+## Contact
+
+Nostr: optout@nostrplebs.com npub1kxgpwh80gp79j0chc925srk6rghw0akggduwau8fwdflslh9jvqqd3lecx
