@@ -32,12 +32,16 @@ struct StateStatic {
 /// The dynamically changing part of the state, single-thread usage
 #[derive(Clone, Default)]
 struct StateDynamicSingle {
+    /// Client pubkey of the signer, if connected (we can send to this pubkey)
     signer_app_pubkey: Option<XOnlyPublicKey>,
+    /// Signer pubkey of the signer, if connected and retrieved (it will sign with this)
     signer_signer_pubkey: Option<XOnlyPublicKey>,
     outstanding_describe_req_id: Option<String>,
     outstanding_get_pubkey_req_id: Option<String>,
     outstanding_sign_req_id: Option<String>,
     outstanding_sign_unsigned_event: Option<UnsignedEvent>,
+    count_sign_requests: u32,
+    count_posts: u32,
 }
 
 /// Dybamic state, thread-safe version
@@ -179,6 +183,7 @@ async fn send_sign(
     let mut sd = state_dynamic.st.write().unwrap();
     sd.outstanding_sign_req_id = Some(msg_to_send.id());
     sd.outstanding_sign_unsigned_event = Some(unsigned_event);
+    sd.count_sign_requests = sd.count_sign_requests + 1;
     // TODO UI notif
     Ok(())
 }
@@ -273,6 +278,9 @@ async fn handle_request_message(
                 let event = unsigned_event.add_signature(signature)?;
                 let id = relay_client.send_event(event).await?;
                 println!("DEBUG: Published event, id {}", id);
+
+                let mut sd = state_dynamic.st.write().unwrap();
+                sd.count_posts = sd.count_posts + 1;
 
                 // TODO UI notif
             } else {
@@ -574,6 +582,7 @@ impl Sandbox for DemoApp {
 
     fn view(&self) -> Element<UiMessage> {
         let state = &*(self.state);
+        let state_dynamic = &*self.state_dynamic.st.read().unwrap();
         column![
             text("Nostr Connect Client").size(25),
             iced::widget::rule::Rule::horizontal(5),
@@ -583,10 +592,7 @@ impl Sandbox for DemoApp {
                 "Relay connection status:",
                 &format!("{:?}", get_connection_status(&state.relay_client))
             ),
-            self.view_text_readonly(
-                "Signer pubkey:",
-                &self.state_dynamic.st.read().unwrap().get_signer_pubkey()
-            ),
+            self.view_text_readonly("Signer pubkey:", &state_dynamic.get_signer_pubkey()),
             iced::widget::rule::Rule::horizontal(5),
             text("Nostr Connect URI:  You need to copy this to the Signer").size(15),
             text_input(
@@ -608,7 +614,12 @@ impl Sandbox for DemoApp {
             .padding(0),
             button("Request Signing").on_press(UiMessage::SendSignRequest),
             iced::widget::rule::Rule::horizontal(5),
-            button("Refresh").on_press(UiMessage::Refresh),
+            self.view_text_readonly(
+                "Sign requests sent:",
+                &state_dynamic.count_sign_requests.to_string()
+            ),
+            self.view_text_readonly("Posts published:", &state_dynamic.count_posts.to_string()),
+            button("Refresh UI").on_press(UiMessage::Refresh), // TODO remove
         ]
         .align_items(Alignment::Fill)
         .spacing(5)
