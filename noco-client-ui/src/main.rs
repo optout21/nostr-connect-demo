@@ -1,12 +1,11 @@
-/// TODO
-/// .1. work
-/// 2. update on UI
-/// 3. send from UI
 use nostr::nips::nip46::{Message, Request};
 use nostr_sdk::prelude::*;
 
 use iced::widget::{button, column, row, text, text_input};
-use iced::{Alignment, Element, Length, Sandbox, Settings};
+use iced::{
+    executor, subscription, Alignment, Application, Command, Element, Length, Settings,
+    Subscription, Theme,
+};
 
 use crossbeam::channel;
 use once_cell::sync::Lazy;
@@ -50,6 +49,8 @@ struct StateDynamic {
     st: RwLock<StateDynamicSingle>,
 }
 
+/// Static event queue used to send notifications to the UI
+static EVENT_QUEUE: Lazy<EventQueue> = Lazy::new(|| EventQueue::new());
 // TODO check if needed
 static STATE: Lazy<StateDynamic> = Lazy::new(|| StateDynamic::init().unwrap());
 
@@ -71,8 +72,27 @@ enum Error {
     InternalAsyncError(#[from] crossbeam::channel::RecvError),
     #[error(transparent)]
     ParseError(#[from] ParseError),
+    #[error("Internal event queue send error")]
+    InternalEventQueueSend,
 }
 
+/// Events that can affect the UI
+#[derive(Clone, Debug)]
+pub enum Event {
+    RelayConnected,
+    SignerConnected,
+    SignerPubkeyObtained,
+    SignRequestSent,
+    PostPublished,
+}
+
+/// Used to notify the UI from the background workers
+pub(crate) struct EventQueue {
+    sender: channel::Sender<Event>,
+    receiver: channel::Receiver<Event>,
+}
+
+/// Struct for the App with UI
 struct DemoApp {
     state: Arc<StateStatic>,
     state_dynamic: Arc<StateDynamic>,
@@ -184,7 +204,10 @@ async fn send_sign(
     sd.outstanding_sign_req_id = Some(msg_to_send.id());
     sd.outstanding_sign_unsigned_event = Some(unsigned_event);
     sd.count_sign_requests = sd.count_sign_requests + 1;
-    // TODO UI notif
+
+    // UI notification
+    EVENT_QUEUE.push(Event::SignRequestSent)?;
+
     Ok(())
 }
 
@@ -208,7 +231,9 @@ async fn handle_request_message(
                 st.signer_app_pubkey = Some(new_signer_app_pubkey);
                 st.signer_signer_pubkey = None;
             }
-            // TODO UI notif
+
+            // UI notification
+            EVENT_QUEUE.push(Event::SignerConnected)?;
 
             // Continue to obtain capabilities
             send_describe(relay_client, &new_signer_app_pubkey, state_dynamic).await?;
@@ -242,7 +267,8 @@ async fn handle_request_message(
 
                 state_dynamic.st.write().unwrap().signer_signer_pubkey = Some(pubkey);
 
-                // TODO UI notif
+                // UI notification
+                EVENT_QUEUE.push(Event::SignerPubkeyObtained)?;
 
                 // Continue to sign request
                 // TODO remove once done from UI
@@ -282,7 +308,8 @@ async fn handle_request_message(
                 let mut sd = state_dynamic.st.write().unwrap();
                 sd.count_posts = sd.count_posts + 1;
 
-                // TODO UI notif
+                // UI notification
+                EVENT_QUEUE.push(Event::PostPublished)?;
             } else {
                 println!("ERROR: ID mismatch");
             }
@@ -343,9 +370,8 @@ async fn connect_and_handle_async(
     // Note: SDK does not give an error here
     relay_client.connect().await;
 
-    /* TODO
-    EVENT_QUEUE.push(Event::SignerConnected)?;
-    */
+    // UI notification
+    EVENT_QUEUE.push(Event::RelayConnected)?;
 
     let _ = wait_and_handle_messages(relay_client, state_dynamic).await?;
 
@@ -503,9 +529,28 @@ async fn send_sign(relay_client: &Client, state: &mut State, text: &str) -> Resu
 }
 */
 
+impl EventQueue {
+    fn new() -> Self {
+        let (sender, receiver) = channel::bounded::<Event>(100);
+        Self { sender, receiver }
+    }
+
+    pub fn push(&self, e: Event) -> Result<(), Error> {
+        self.sender
+            .send(e)
+            .map_err(|_e| Error::InternalEventQueueSend)
+    }
+
+    pub fn pop(&self) -> Result<Event, Error> {
+        let e = self.receiver.recv()?;
+        Ok(e)
+    }
+}
+
 #[derive(Clone, Debug)]
 enum UiMessage {
     Refresh,
+    Event(Event),
     ChangedReadonly,
     SetPostText(String),
     SendSignRequest,
@@ -525,9 +570,6 @@ impl DemoApp {
     /*
     fn send_sign_bg(&self) -> Result<(), Error> {
         let text = self.post_text.clone();
-        // TODO
-        // TODO
-        // TODO
         // TODO
         /*
         let state_clone = self.state.clone();
@@ -554,13 +596,21 @@ impl DemoApp {
     }
 }
 
-impl Sandbox for DemoApp {
-    type Message = UiMessage;
+pub enum SubscriptionState {
+    Uninited,
+    Inited,
+}
 
-    fn new() -> Self {
+impl Application for DemoApp {
+    type Message = UiMessage;
+    type Theme = Theme;
+    type Executor = executor::Default;
+    type Flags = ();
+
+    fn new(_flags: ()) -> (Self, Command<UiMessage>) {
         match DemoApp::new() {
             Err(e) => panic!("Error {:?}", e),
-            Ok(app) => app,
+            Ok(app) => (app, Command::none()),
         }
     }
 
@@ -568,16 +618,42 @@ impl Sandbox for DemoApp {
         String::from("Nostr Connect Demo Client")
     }
 
-    fn update(&mut self, message: UiMessage) {
+    fn subscription(&self) -> Subscription<UiMessage> {
+        subscription::unfold(
+            std::any::TypeId::of::<DemoApp>(),
+            SubscriptionState::Uninited,
+            move |state| async move {
+                match state {
+                    SubscriptionState::Uninited => (None, SubscriptionState::Inited),
+                    SubscriptionState::Inited => match EVENT_QUEUE.pop() {
+                        Err(e) => {
+                            println!("DEBUG: Subscription: error {:?}", e);
+                            (None, SubscriptionState::Inited)
+                        }
+                        Ok(event) => {
+                            println!("DEBUG: Subscription: Got event {:?}", event);
+                            (Some(UiMessage::Event(event)), SubscriptionState::Inited)
+                        }
+                    },
+                }
+            },
+        )
+    }
+
+    fn update(&mut self, message: UiMessage) -> Command<UiMessage> {
         match message {
             UiMessage::Refresh => {}
             UiMessage::ChangedReadonly => {}
+            UiMessage::Event(_) => {
+                // implicit UI refresh is enough here, no more action needed
+            }
             UiMessage::SetPostText(s) => self.post_text = s,
             UiMessage::SendSignRequest => {
                 // TODO
                 // let _ = self.send_sign_bg();
             }
         }
+        Command::none()
     }
 
     fn view(&self) -> Element<UiMessage> {
