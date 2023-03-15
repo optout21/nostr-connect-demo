@@ -2,6 +2,7 @@ use nostr::nips::nip46::{Message, Request};
 use nostr_sdk::prelude::*;
 use std::time::Duration;
 
+/// Could be random, using fixed so that the Connect URI is constant, for testing convenience
 const APP_SECRET_KEY: &str = "nsec1ufnus6pju578ste3v90xd5m2decpuzpql2295m3sknqcjzyys9ls0qlc85";
 const APP_RELAY: &str = "wss://nos.lol";
 
@@ -17,11 +18,12 @@ async fn main() -> Result<()> {
         "NoConnect-Client",
     )
     .url(Url::parse("https://example.com")?);
-    println!("Nostr Connect URI: {nostr_connect_uri}");
+    println!("Nostr Connect URI: \n\n{nostr_connect_uri}\n");
 
     let opts = Options::new().wait_for_send(true);
     let relay_client = Client::new_with_opts(&app_keys, opts);
     relay_client.add_relay(APP_RELAY, None).await?;
+    // Warning: error is not handled here, should check back status
     relay_client.connect().await;
     println!("Connected to relay {APP_RELAY}");
 
