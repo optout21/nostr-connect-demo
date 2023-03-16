@@ -1,5 +1,5 @@
 # nostr-connect-demo
-Demo app pair for Nostr Connect NIP-46
+Demo app pair for Nostr Connect NIP-46, including a client with UI.
 
 ## Warning
 
@@ -11,6 +11,13 @@ This a sample demo, the signer does blind signing, use only with test keys (neve
 
 ```
 cd noco-client
+cargo run
+```
+
+OR
+
+```
+cd noco-client-ui
 cargo run
 ```
 
@@ -36,7 +43,7 @@ The flow of events is somthing like this:
 - Signer replies
 - Client sends a GetPublicKey request
 - Signer replies
-- Client sends a SignEvent request
+- Client sends a SignEvent request -- on UI version this is triggered by a button
 - Signer signs and replies
 - Client publiches the resulting signed message
 
@@ -67,8 +74,9 @@ Published event, count 1, id 8f9e4f0a076da48f5bf261a257e2d2fd229ad01eac8851f9995
 
 ## References
 
-- NIP-26 Delegations Spec https://github.com/nostr-protocol/nips/blob/master/26.md
+- [Keystr app](https://github.com/keystr/keystr-rs) with Signer support
 - [Sample](https://github.com/rust-nostr/nostr/blob/master/crates/nostr-sdk/examples/nostr_connect.rs) in [rust-nostr/nostr-sdk](https://github.com/rust-nostr/nostr) by [yukibtc](https://github.com/yukibtc)
+- NIP-46 Delegations Spec https://github.com/nostr-protocol/nips/blob/master/46.md
 
 ## Contact
 
