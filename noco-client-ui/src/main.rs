@@ -35,6 +35,8 @@ struct StateDynamicSingle {
     signer_app_pubkey: Option<XOnlyPublicKey>,
     /// Signer pubkey of the signer, if connected and retrieved (it will sign with this)
     signer_signer_pubkey: Option<XOnlyPublicKey>,
+    /// The capabilities of the Signer, as returned by describe, stored for display
+    signer_capabilities: Option<String>,
     outstanding_describe_req_id: Option<String>,
     outstanding_get_pubkey_req_id: Option<String>,
     outstanding_sign_req_id: Option<String>,
@@ -80,6 +82,7 @@ enum Error {
 pub enum Event {
     RelayConnected,
     SignerConnected,
+    SignerCapabsObtained,
     SignerPubkeyObtained,
     SignRequestSent,
     PostPublished,
@@ -273,7 +276,15 @@ async fn handle_request_message(
                 let values = serde_json::from_value::<Vec<String>>(value.to_owned())?;
                 println!("DEBUG: Got Describe response, {:?}", values);
 
-                // Continue to obtains signer public key
+                // store result
+                {
+                    let mut st = state_dynamic.st.write().unwrap();
+                    st.signer_capabilities = Some(values.join(","));
+                }
+                // UI notification
+                EVENT_QUEUE.push(Event::SignerCapabsObtained)?;
+
+                // Continue to obtain signer public key
                 send_get_public_key(relay_client, &signer_app_pubkey.unwrap(), state_dynamic)
                     .await?;
             } else {
@@ -662,13 +673,20 @@ impl Application for DemoApp {
                 "Relay connection status:",
                 &format!("{:?}", connection_status)
             ),
-            self.view_text_readonly("Signer pubkey:", &state_dynamic.get_signer_pubkey()),
-            iced::widget::rule::Rule::horizontal(5),
+            self.view_text_readonly("Signer signer pubkey:", &state_dynamic.get_signer_pubkey()),
+            self.view_text_readonly(
+                "Signer capabilities:",
+                &state_dynamic
+                    .signer_capabilities
+                    .as_ref()
+                    .unwrap_or(&"-".to_string())
+            ),
             self.view_text_readonly(
                 "Sign requests sent:",
                 &state_dynamic.count_sign_requests.to_string()
             ),
             self.view_text_readonly("Posts published:", &state_dynamic.count_posts.to_string()),
+            iced::widget::rule::Rule::horizontal(5),
         ]
         .align_items(Alignment::Fill)
         .spacing(5)
