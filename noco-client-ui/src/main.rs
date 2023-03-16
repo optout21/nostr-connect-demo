@@ -14,7 +14,7 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 /// Relay to use
-const DEFAULT_APP_RELAY: &str = "ws://umbrel.local:4848"; //"wss://nos.lol";
+const DEFAULT_APP_RELAY: &str = "wss://nos.lol";
 /// Could be random, using fixed so that the Connect URI is constant, for testing convenience
 const APP_SECRET_KEY: &str = "nsec1ufnus6pju578ste3v90xd5m2decpuzpql2295m3sknqcjzyys9ls0qlc85";
 /// Included in connect URI, has no real relevance here
