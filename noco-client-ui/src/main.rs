@@ -43,16 +43,13 @@ struct StateDynamicSingle {
     count_posts: u32,
 }
 
-/// Dybamic state, thread-safe version
-// #[derive(Clone)]
+/// Dynamic state, thread-safe version
 struct StateDynamic {
     st: RwLock<StateDynamicSingle>,
 }
 
 /// Static event queue used to send notifications to the UI
 static EVENT_QUEUE: Lazy<EventQueue> = Lazy::new(|| EventQueue::new());
-// TODO check if needed
-static STATE: Lazy<StateDynamic> = Lazy::new(|| StateDynamic::init().unwrap());
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -72,6 +69,8 @@ enum Error {
     InternalAsyncError(#[from] crossbeam::channel::RecvError),
     #[error(transparent)]
     ParseError(#[from] ParseError),
+    #[error("No Signer is connected, or no signer key is available")]
+    NoSignerConnected,
     #[error("Internal event queue send error")]
     InternalEventQueueSend,
 }
@@ -126,8 +125,6 @@ impl StateStatic {
 
         Ok(Self {
             relay_str,
-            // app_secret_key,
-            // app_keys,
             nostr_connect_str,
             relay_client,
         })
@@ -211,6 +208,33 @@ async fn send_sign(
     Ok(())
 }
 
+fn send_sign_blocking(
+    relay_client: &Client,
+    signer_app_pubkey: &XOnlyPublicKey,
+    signer_signer_pubkey: XOnlyPublicKey,
+    text: &str,
+    state_dynamic: Arc<StateDynamic>,
+) -> Result<(), Error> {
+    let (tx, rx) = channel::bounded(1);
+    let relay_client_clone = relay_client.clone();
+    let signer_app_pubkey_clone = signer_app_pubkey.clone();
+    let text_clone = text.to_owned();
+    let handle = tokio::runtime::Handle::current();
+    handle.spawn(async move {
+        let _ = send_sign(
+            &relay_client_clone,
+            &signer_app_pubkey_clone,
+            signer_signer_pubkey,
+            &text_clone,
+            state_dynamic,
+        )
+        .await;
+        let _ = tx.send(1);
+    });
+    let _ = rx.recv()?;
+    Ok(())
+}
+
 /// Handle a message/request received (from relay)
 async fn handle_request_message(
     relay_client: &Client,
@@ -269,18 +293,6 @@ async fn handle_request_message(
 
                 // UI notification
                 EVENT_QUEUE.push(Event::SignerPubkeyObtained)?;
-
-                // Continue to sign request
-                // TODO remove once done from UI
-                let signer_signer_pubkey = state_dynamic.get_signer_signer_pubkey().clone();
-                send_sign(
-                    relay_client,
-                    &signer_app_pubkey.unwrap(),
-                    signer_signer_pubkey.unwrap(),
-                    "Sample text",
-                    state_dynamic,
-                )
-                .await?;
             } else {
                 println!("ERROR: ID mismatch");
             }
@@ -296,7 +308,6 @@ async fn handle_request_message(
                     .st
                     .read()
                     .unwrap()
-                    // .deref()
                     .outstanding_sign_unsigned_event
                     .as_ref()
                     .unwrap()
@@ -336,6 +347,9 @@ async fn wait_and_handle_messages(
         .await;
     println!("DEBUG: Subscribed to relay events ...");
     println!("DEBUG: Waiting for messages, first for a 'connect' from a signer ...");
+
+    // UI notification
+    EVENT_QUEUE.push(Event::RelayConnected)?;
 
     loop {
         let mut notifications = relay_client.notifications();
@@ -429,16 +443,6 @@ fn get_connection_status(relay_client: &Client) -> ConnectionStatus {
     }
 }
 
-/*
-    fn send_sign_bg(&mut self, text: &str) -> Result<(), Error> {
-        let self_clone = self.clone();
-        tokio::runtime::Handle::current().spawn(async move {
-            let _ = self.send_sign(text).await;
-        });
-        Ok(())
-    }
-*/
-
 impl StateDynamicSingle {
     fn get_signer_pubkey(&self) -> String {
         match self.signer_signer_pubkey {
@@ -481,53 +485,7 @@ impl StateDynamic {
     fn get_signer_signer_pubkey(&self) -> Option<XOnlyPublicKey> {
         self.st.read().unwrap().signer_signer_pubkey.clone()
     }
-
-    /*
-    async fn send_sign(&self, text: &str) -> Result<(), Error> {
-        let st = self.st.read().unwrap();
-        send_sign(
-            &st.relay_client,
-            &st.signer_app_pubkey,
-            st.signer_signer_pubkey.clone(),
-            text,
-        )
-        .await
-    }
-    */
 }
-
-/*
-async fn send_sign_request(state_arc: Arc<State>) -> Result<(), Error> {
-    let state_clone = state_arc.clone();
-    let state = &*state_clone.lock().unwrap();
-    let state_mut_clone = state_arc.clone();
-    let mut state_mut = &mut *state_mut_clone.lock().unwrap();
-    let relay_client = state.relay_client.as_ref().unwrap();
-    let text = state_mut.clone().post_text;
-    // let mut state_mut = state_clone.clone();
-    let _ = send_sign(&relay_client, &mut state_mut, &text).await?;
-    Ok(())
-}
-
-async fn send_sign(relay_client: &Client, state: &mut State, text: &str) -> Result<(), Error> {
-    println!("Sending Sign ...");
-
-    let signer_pubkey = state.signer_signer_pubkey.unwrap();
-    // compose unsigned event
-    state.post_count = state.post_count + 1;
-    let unsigned_event = EventBuilder::new_text_note(text, &[]).to_unsigned_event(signer_pubkey);
-    let msg_to_send = Message::request(Request::SignEvent(unsigned_event.clone()));
-    let _ = send_message(
-        relay_client,
-        &msg_to_send,
-        &state.signer_app_pubkey.unwrap(),
-    )
-    .await?;
-    state.outstanding_sign_req_id = Some(msg_to_send.id());
-    state.outstanding_sign_unsigned_event = Some(unsigned_event);
-    Ok(())
-}
-*/
 
 impl EventQueue {
     fn new() -> Self {
@@ -549,7 +507,6 @@ impl EventQueue {
 
 #[derive(Clone, Debug)]
 enum UiMessage {
-    Refresh,
     Event(Event),
     ChangedReadonly,
     SetPostText(String),
@@ -567,19 +524,25 @@ impl DemoApp {
         Ok(app)
     }
 
-    /*
-    fn send_sign_bg(&self) -> Result<(), Error> {
+    fn send_sign_request(&self) -> Result<(), Error> {
         let text = self.post_text.clone();
-        // TODO
-        /*
-        let state_clone = self.state.clone();
-        tokio::runtime::Handle::current().spawn(async move {
-            state_clone.send_sign(&text);
-        });
-        */
+        let signer_app_pubkey = match self.state_dynamic.get_signer_app_pubkey() {
+            None => return Err(Error::NoSignerConnected),
+            Some(k) => k,
+        };
+        let signer_signer_pubkey = match self.state_dynamic.get_signer_signer_pubkey() {
+            None => return Err(Error::NoSignerConnected),
+            Some(k) => k,
+        };
+        let _ = send_sign_blocking(
+            &self.state.relay_client,
+            &signer_app_pubkey,
+            signer_signer_pubkey,
+            &text,
+            self.state_dynamic.clone(),
+        )?;
         Ok(())
     }
-    */
 
     fn view_text_readonly(&self, label: &str, value: &str) -> Element<UiMessage> {
         let label_width = Length::Fixed(150.0);
@@ -642,15 +605,13 @@ impl Application for DemoApp {
 
     fn update(&mut self, message: UiMessage) -> Command<UiMessage> {
         match message {
-            UiMessage::Refresh => {}
             UiMessage::ChangedReadonly => {}
             UiMessage::Event(_) => {
                 // implicit UI refresh is enough here, no more action needed
             }
             UiMessage::SetPostText(s) => self.post_text = s,
             UiMessage::SendSignRequest => {
-                // TODO
-                // let _ = self.send_sign_bg();
+                let _ = self.send_sign_request();
             }
         }
         Command::none()
@@ -659,16 +620,21 @@ impl Application for DemoApp {
     fn view(&self) -> Element<UiMessage> {
         let state = &*(self.state);
         let state_dynamic = &*self.state_dynamic.st.read().unwrap();
+        let connection_status = get_connection_status(&state.relay_client);
         column![
             text("Nostr Connect Client").size(25),
             iced::widget::rule::Rule::horizontal(5),
-            self.view_text_readonly("Relay:", &state.relay_str),
-            self.view_text_readonly("App URL:", SAMPLE_WEB_URL),
-            self.view_text_readonly(
-                "Relay connection status:",
-                &format!("{:?}", get_connection_status(&state.relay_client))
-            ),
-            self.view_text_readonly("Signer pubkey:", &state_dynamic.get_signer_pubkey()),
+            text(match connection_status {
+                ConnectionStatus::NotConnected => "Not connected to relay!",
+                ConnectionStatus::Connecting => "Connecting to relay...",
+                ConnectionStatus::Connected => {
+                    match state_dynamic.signer_signer_pubkey {
+                        None => "Connect with a Signer using the nostrconnect URI below!",
+                        Some(_) => "Enter text for a post below, and request Signning!",
+                    }
+                }
+            })
+            .size(20),
             iced::widget::rule::Rule::horizontal(5),
             text("Nostr Connect URI:  You need to copy this to the Signer").size(15),
             text_input(
@@ -679,7 +645,7 @@ impl Application for DemoApp {
             .size(15),
             iced::widget::rule::Rule::horizontal(5),
             row![
-                text("Post text:"),
+                text("Post text:").size(15),
                 text_input(
                     "Enter message text here",
                     &self.post_text,
@@ -690,12 +656,19 @@ impl Application for DemoApp {
             .padding(0),
             button("Request Signing").on_press(UiMessage::SendSignRequest),
             iced::widget::rule::Rule::horizontal(5),
+            self.view_text_readonly("Relay:", &state.relay_str),
+            self.view_text_readonly("App URL:", SAMPLE_WEB_URL),
+            self.view_text_readonly(
+                "Relay connection status:",
+                &format!("{:?}", connection_status)
+            ),
+            self.view_text_readonly("Signer pubkey:", &state_dynamic.get_signer_pubkey()),
+            iced::widget::rule::Rule::horizontal(5),
             self.view_text_readonly(
                 "Sign requests sent:",
                 &state_dynamic.count_sign_requests.to_string()
             ),
             self.view_text_readonly("Posts published:", &state_dynamic.count_posts.to_string()),
-            button("Refresh UI").on_press(UiMessage::Refresh), // TODO remove
         ]
         .align_items(Alignment::Fill)
         .spacing(5)
