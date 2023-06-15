@@ -10,7 +10,7 @@ const APP_RELAY: &str = "wss://nos.lol";
 async fn main() -> Result<()> {
     let app_secret_key = SecretKey::from_bech32(APP_SECRET_KEY)?;
     let app_keys = Keys::new(app_secret_key);
-    println!("My pubkey {}", app_keys.public_key());
+    println!("My pubkey {} {}", app_keys.public_key(), app_keys.public_key().to_bech32().unwrap());
 
     let nostr_connect_uri: NostrConnectURI = NostrConnectURI::new(
         app_keys.public_key(),

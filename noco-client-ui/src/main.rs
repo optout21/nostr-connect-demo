@@ -1,5 +1,10 @@
-use nostr::nips::nip46::{Message, Request};
-use nostr_sdk::prelude::*;
+use nostr_sdk::nostr::nips::nip26::DelegationTag;
+use nostr_sdk::nostr::nips::nip46::{Message, Request};
+use nostr_sdk::prelude::{
+    decrypt, json, Client, Condition, Conditions, EventBuilder, EventProperties, Filter,
+    FromBech32, Keys, Kind, NostrConnectURI, Options, ParseError, RelayPoolNotification,
+    RelayStatus, Result, SecretKey, Tag, Timestamp, ToBech32, UnsignedEvent, Url, XOnlyPublicKey,
+};
 
 use iced::widget::{button, column, row, text, text_input};
 use iced::{
@@ -37,9 +42,12 @@ struct StateDynamicSingle {
     signer_signer_pubkey: Option<XOnlyPublicKey>,
     /// The capabilities of the Signer, as returned by describe, stored for display
     signer_capabilities: Option<String>,
+    /// Optional delegation tag, obtained from signer, used when posting
+    delegation_tag: Option<DelegationTag>,
     outstanding_describe_req_id: Option<String>,
     outstanding_get_pubkey_req_id: Option<String>,
     outstanding_sign_req_id: Option<String>,
+    outstanding_delegate_req_id: Option<String>,
     outstanding_sign_unsigned_event: Option<UnsignedEvent>,
     count_sign_requests: u32,
     count_posts: u32,
@@ -75,6 +83,10 @@ enum Error {
     NoSignerConnected,
     #[error("Internal event queue send error")]
     InternalEventQueueSend,
+    #[error("There is no delegation tag")]
+    DelegationTagMissing,
+    #[error("Delegation tag is invalid")]
+    DelegationTagInvalid,
 }
 
 /// Events that can affect the UI
@@ -85,7 +97,10 @@ pub enum Event {
     SignerCapabsObtained,
     SignerPubkeyObtained,
     SignRequestSent,
+    DelegateRequestSent,
     PostPublished,
+    DelegationTagUpdated,
+    DelegatedPostPublished,
 }
 
 /// Used to notify the UI from the background workers
@@ -124,7 +139,7 @@ impl StateStatic {
 
         // Create relay client now, but do not connect it yet
         let opts = Options::new().wait_for_send(true);
-        let relay_client = Client::new_with_opts(&app_keys, opts);
+        let relay_client = Client::with_opts(&app_keys, opts);
 
         Ok(Self {
             relay_str,
@@ -141,6 +156,21 @@ fn message_method(msg: &Message) -> String {
     }
 }
 
+/// Send an event through the relays
+async fn send_event(
+    relay_client: &Client,
+    event: &nostr_sdk::Event,
+    prefix: &str,
+) -> Result<(), Error> {
+    let event_id = relay_client.send_event(event.clone()).await?;
+    println!(
+        "DEBUG: Event with {} sent, {} {:?}",
+        prefix, event_id, event
+    );
+    Ok(())
+}
+
+/// Send a Signer request message
 async fn send_message(
     relay_client: &Client,
     msg: &Message,
@@ -149,7 +179,7 @@ async fn send_message(
     let keys = relay_client.keys();
     let event =
         EventBuilder::nostr_connect(&keys, *receiver_pubkey, msg.clone())?.to_event(&keys)?;
-    relay_client.send_event(event).await?;
+    let _ = send_event(relay_client, &event, "signer message").await?;
     println!("Message sent, {}", message_method(&msg),);
     Ok(())
 }
@@ -238,13 +268,146 @@ fn send_sign_blocking(
     Ok(())
 }
 
+/// Send a Delegate request (sign request for delegation)
+async fn send_delegate_req(
+    relay_client: &Client,
+    my_app_pubkey: &XOnlyPublicKey,
+    signer_app_pubkey: &XOnlyPublicKey,
+    state_dynamic: Arc<StateDynamic>,
+) -> Result<(), Error> {
+    println!("DEBUG Sending Delegate request ...");
+
+    let mut conditions = Conditions::default();
+    // add conditions (before)
+    conditions.add(Condition::Kind(Kind::TextNote.as_u64()));
+    let now = Timestamp::now();
+    let before = now.as_u64() + 30 * 24 * 60 * 60;
+    conditions.add(Condition::CreatedBefore(before));
+    let msg_to_send = Message::request(Request::Delegate {
+        public_key: my_app_pubkey.clone(),
+        conditions,
+    });
+    let _ = send_message(relay_client, &msg_to_send, signer_app_pubkey).await?;
+    let mut sd = state_dynamic.st.write().unwrap();
+    sd.outstanding_delegate_req_id = Some(msg_to_send.id());
+    sd.count_sign_requests = sd.count_sign_requests + 1;
+
+    // UI notification
+    EVENT_QUEUE.push(Event::DelegateRequestSent)?;
+
+    Ok(())
+}
+
+fn send_delegate_blocking(
+    relay_client: &Client,
+    my_app_pubkey: &XOnlyPublicKey,
+    signer_app_pubkey: &XOnlyPublicKey,
+    state_dynamic: Arc<StateDynamic>,
+) -> Result<(), Error> {
+    let (tx, rx) = channel::bounded(1);
+    let relay_client_clone = relay_client.clone();
+    let my_app_pubkey_clone = my_app_pubkey.clone();
+    let signer_app_pubkey_clone = signer_app_pubkey.clone();
+    let handle = tokio::runtime::Handle::current();
+    handle.spawn(async move {
+        let _ = send_delegate_req(
+            &relay_client_clone,
+            &my_app_pubkey_clone,
+            &signer_app_pubkey_clone,
+            state_dynamic,
+        )
+        .await;
+        let _ = tx.send(1);
+    });
+    let _ = rx.recv()?;
+    Ok(())
+}
+
+/// Post a note in my own name, but with the delegation tag
+async fn send_delegated_note(
+    relay_client: &Client,
+    text: &str,
+    state_dynamic: Arc<StateDynamic>,
+) -> Result<(), Error> {
+    // prepare delegation tag
+    let mut tags: Vec<Tag> = vec![];
+    if let Some(dtag) = &state_dynamic.st.read().unwrap().delegation_tag {
+        let delegation_tag = Tag::Delegation {
+            delegator_pk: dtag.delegator_pubkey(),
+            conditions: dtag.conditions(),
+            sig: dtag.signature(),
+        };
+        tags.push(delegation_tag);
+    } else {
+        println!("ERROR: Missing delegation!");
+        return Err(Error::DelegationTagMissing);
+    }
+
+    // compose event
+    let event = EventBuilder::new_text_note(text, &tags).to_event(&relay_client.keys())?;
+
+    // Validate delegation tag, to be sure
+    if let Some(dtag) = &state_dynamic.st.read().unwrap().delegation_tag {
+        match dtag.validate(
+            relay_client.keys().public_key(),
+            &EventProperties::from_event(&event),
+        ) {
+            Err(e) => {
+                println!(
+                    "ERROR: Delegation tag is invalid, {:?} {} {} {}  {} {}",
+                    e,
+                    match &e {
+                        nostr_sdk::nips::nip26::Error::ConditionsValidation(ie) => ie.to_string(),
+                        _ => "?".to_string(),
+                    },
+                    dtag,
+                    dtag.conditions(),
+                    event.kind.as_u64(),
+                    event.created_at.as_u64(),
+                );
+                return Err(Error::DelegationTagInvalid);
+            }
+            Ok(_) => {}
+        }
+    }
+
+    println!("DEBUG Posting note with delegation ...");
+    let _ = send_event(relay_client, &event.clone(), "note with delegation").await?;
+
+    println!("Note with delegation sent");
+    let mut sdw = state_dynamic.st.write().unwrap();
+    sdw.count_posts = sdw.count_posts + 1;
+
+    // UI notification
+    EVENT_QUEUE.push(Event::DelegatedPostPublished)?;
+
+    Ok(())
+}
+
+fn send_delegated_note_blocking(
+    relay_client: &Client,
+    text: &str,
+    state_dynamic: Arc<StateDynamic>,
+) -> Result<(), Error> {
+    let (tx, rx) = channel::bounded(1);
+    let relay_client_clone = relay_client.clone();
+    let text_clone = text.to_string();
+    let handle = tokio::runtime::Handle::current();
+    handle.spawn(async move {
+        let _ = send_delegated_note(&relay_client_clone, &text_clone, state_dynamic).await;
+        let _ = tx.send(1);
+    });
+    let _ = rx.recv()?;
+    Ok(())
+}
+
 /// Handle a message/request received (from relay)
 async fn handle_request_message(
     relay_client: &Client,
     msg: &Message,
     state_dynamic: Arc<StateDynamic>,
 ) -> Result<(), Error> {
-    println!("DEBUG: New message received {}", message_method(msg));
+    println!("DEBUG: New message received '{}'", message_method(msg));
 
     let signer_app_pubkey = state_dynamic.get_signer_app_pubkey().clone();
 
@@ -288,7 +451,7 @@ async fn handle_request_message(
                 send_get_public_key(relay_client, &signer_app_pubkey.unwrap(), state_dynamic)
                     .await?;
             } else {
-                println!("ERROR: ID mismatch");
+                println!("ERROR: ID/type mismatch");
             }
         } else if &state_dynamic.get_outstanding_get_pubkey_req_id() == id {
             if let Some(value) = result {
@@ -305,7 +468,7 @@ async fn handle_request_message(
                 // UI notification
                 EVENT_QUEUE.push(Event::SignerPubkeyObtained)?;
             } else {
-                println!("ERROR: ID mismatch");
+                println!("ERROR: ID/type mismatch");
             }
         } else if &state_dynamic.get_outstanding_get_sign_req_id() == id {
             if let Some(value) = result {
@@ -324,8 +487,8 @@ async fn handle_request_message(
                     .unwrap()
                     .clone();
                 let event = unsigned_event.add_signature(signature)?;
-                let id = relay_client.send_event(event).await?;
-                println!("DEBUG: Published event, id {}", id);
+                let _ = send_event(relay_client, &event, "note").await?;
+                println!("DEBUG: Published post");
 
                 let mut sd = state_dynamic.st.write().unwrap();
                 sd.count_posts = sd.count_posts + 1;
@@ -333,7 +496,35 @@ async fn handle_request_message(
                 // UI notification
                 EVENT_QUEUE.push(Event::PostPublished)?;
             } else {
-                println!("ERROR: ID mismatch");
+                println!("ERROR: ID/type mismatch");
+            }
+        } else if &state_dynamic.get_outstanding_get_delegate_req_id() == id {
+            if let Some(value) = result {
+                state_dynamic
+                    .st
+                    .write()
+                    .unwrap()
+                    .outstanding_delegate_req_id = None;
+                let delegation_result = serde_json::from_value::<
+                    nostr_sdk::nips::nip46::DelegationResult,
+                >(value.to_owned())?;
+                println!("DEBUG: Got Delegate response, {:?}", delegation_result);
+
+                // We need to create the delegation tag, but we have the signature and not the keys, for this a trick is needed
+                let tag = json!([
+                    "delegation",
+                    delegation_result.from.to_string(),
+                    delegation_result.cond.to_string(),
+                    delegation_result.sig.to_string(),
+                ]);
+                if let Ok(delegation_tag) = DelegationTag::from_json(&tag.to_string()) {
+                    println!("DEBUG: DelegationTag {:?}", delegation_tag);
+                    state_dynamic.st.write().unwrap().delegation_tag = Some(delegation_tag);
+                    // UI notification
+                    EVENT_QUEUE.push(Event::DelegationTagUpdated)?;
+                }
+            } else {
+                println!("ERROR: ID/type mismatch");
             }
         }
     } else {
@@ -489,6 +680,10 @@ impl StateDynamic {
         option_string_to_string(&self.st.read().unwrap().outstanding_sign_req_id)
     }
 
+    fn get_outstanding_get_delegate_req_id(&self) -> String {
+        option_string_to_string(&self.st.read().unwrap().outstanding_delegate_req_id)
+    }
+
     fn get_signer_app_pubkey(&self) -> Option<XOnlyPublicKey> {
         self.st.read().unwrap().signer_app_pubkey.clone()
     }
@@ -522,6 +717,8 @@ enum UiMessage {
     ChangedReadonly,
     SetPostText(String),
     SendSignRequest,
+    SendDelegateRequest,
+    DoPostDelegated,
 }
 
 impl DemoApp {
@@ -549,6 +746,31 @@ impl DemoApp {
             &self.state.relay_client,
             &signer_app_pubkey,
             signer_signer_pubkey,
+            &text,
+            self.state_dynamic.clone(),
+        )?;
+        Ok(())
+    }
+
+    fn send_delegate_request(&self) -> Result<(), Error> {
+        let my_app_pubkey = &self.state.relay_client.keys().public_key();
+        let signer_app_pubkey = match self.state_dynamic.get_signer_app_pubkey() {
+            None => return Err(Error::NoSignerConnected),
+            Some(k) => k,
+        };
+        let _ = send_delegate_blocking(
+            &self.state.relay_client,
+            my_app_pubkey,
+            &signer_app_pubkey,
+            self.state_dynamic.clone(),
+        )?;
+        Ok(())
+    }
+
+    fn send_delegated_note(&self) -> Result<(), Error> {
+        let text = self.post_text.clone();
+        let _ = send_delegated_note_blocking(
+            &self.state.relay_client,
             &text,
             self.state_dynamic.clone(),
         )?;
@@ -624,6 +846,12 @@ impl Application for DemoApp {
             UiMessage::SendSignRequest => {
                 let _ = self.send_sign_request();
             }
+            UiMessage::SendDelegateRequest => {
+                let _ = self.send_delegate_request();
+            }
+            UiMessage::DoPostDelegated => {
+                let _ = self.send_delegated_note();
+            }
         }
         Command::none()
     }
@@ -632,6 +860,10 @@ impl Application for DemoApp {
         let state = &*(self.state);
         let state_dynamic = &*self.state_dynamic.st.read().unwrap();
         let connection_status = get_connection_status(&state.relay_client);
+        let dtag_string = match &state_dynamic.delegation_tag {
+            Some(dtag) => dtag.to_string(),
+            None => "(none)".to_string(),
+        };
         column![
             text("Nostr Connect Client").size(25),
             iced::widget::rule::Rule::horizontal(5),
@@ -665,7 +897,16 @@ impl Application for DemoApp {
             ]
             .spacing(10)
             .padding(0),
+            iced::widget::rule::Rule::horizontal(5),
+            text("Ask Signer to sign, then post it").size(15),
             button("Request Signing").on_press(UiMessage::SendSignRequest),
+            iced::widget::rule::Rule::horizontal(5),
+            text("Optional: ask Signer to give a delegation, post using the delegation").size(15),
+            row![
+                button("Request Delegation").on_press(UiMessage::SendDelegateRequest),
+                button("Post with delegation").on_press(UiMessage::DoPostDelegated),
+            ]
+            .spacing(10),
             iced::widget::rule::Rule::horizontal(5),
             self.view_text_readonly("Relay:", &state.relay_str),
             self.view_text_readonly("App URL:", SAMPLE_WEB_URL),
@@ -681,6 +922,7 @@ impl Application for DemoApp {
                     .as_ref()
                     .unwrap_or(&"-".to_string())
             ),
+            self.view_text_readonly("Delegation tag:", &dtag_string),
             self.view_text_readonly(
                 "Sign requests sent:",
                 &state_dynamic.count_sign_requests.to_string()

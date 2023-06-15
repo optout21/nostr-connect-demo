@@ -35,7 +35,7 @@ cargo run
 
 ## Flow
 
-The flow of events is somthing like this:
+The flow of events is something like this:
 
 - Signer connects to the client
 - Client accepts the connection
@@ -46,6 +46,14 @@ The flow of events is somthing like this:
 - Client sends a SignEvent request -- on UI version this is triggered by a button
 - Signer signs and replies
 - Client publiches the resulting signed message
+
+The NIP-46 + NIP-26 combo is also supported (client-ui):
+
+- Signer connects to the client
+- Client sends a Delegate request
+- Signer replies with a delegation tag, that is stored
+- Client can post a message directly, with the delegation tag
+
 
 ## Sample Output
 
